@@ -1,9 +1,9 @@
-import { extractUserFromRequest, handleError } from '../../../../../../lib/utils/api-helpers.js';
-import { ApiResponse } from '../../../../../../lib/utils/response.js';
-import { withMethodHandlers, corsHandler } from '../../../../../../lib/withLogging.js';
-import { StatusService } from '../../../../../../lib/services/index.js';
-import socketManager from '../../../../../../lib/socket-instance.js';
-import { logger } from '../../../../../../lib/logger.js';
+import { extractUserFromRequest, handleError } from '../../../../../lib/utils/api-helpers.js';
+import { ApiResponse } from '../../../../../lib/utils/response.js';
+import { withMethodHandlers, corsHandler } from '../../../../../lib/withLogging.js';
+import { StatusService } from '../../../../../lib/services/index.js';
+import socketManager from '../../../../../lib/socket-instance.js';
+import { logger } from '../../../../../lib/logger.js';
 
 async function handleDelete(req, res) {
   await corsHandler(req, res, () => {});
