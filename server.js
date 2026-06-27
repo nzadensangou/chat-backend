@@ -127,28 +127,6 @@ io.on('connection', (socket) => {
     io.emit('user:online', { userId, userName, timestamp: new Date() });
   });
 
-  // Rejoindre la room d'une conversation (pour recevoir message:new)
-  socket.on('conversation:join', (data) => {
-    const { conversationId } = data;
-    if (!conversationId) {
-      logger.warn({ socketId: socket.id }, 'conversation:join sans conversationId');
-      return;
-    }
-    socket.join(`conversation:${conversationId}`);
-    logger.debug({ userId: socket.userId, conversationId }, 'Socket joined conversation room');
-  });
-
-  // Quitter la room d'une conversation
-  socket.on('conversation:leave', (data) => {
-    const { conversationId } = data;
-    if (!conversationId) {
-      logger.warn({ socketId: socket.id }, 'conversation:leave sans conversationId');
-      return;
-    }
-    socket.leave(`conversation:${conversationId}`);
-    logger.debug({ userId: socket.userId, conversationId }, 'Socket left conversation room');
-  });
-
   // Message envoyé
   socket.on('message:send', (data) => {
     const { conversationId, recipientId, message } = data;
