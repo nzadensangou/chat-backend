@@ -146,10 +146,13 @@ io.on('connection', (socket) => {
   // en temps réel. MessageService.createMessage() émet vers
   // `conversation:${conversationID}` — sans ce handler, ce room reste vide
   // et aucun client ne reçoit jamais les messages en temps réel.
-  socket.on('conversation:join', (data) => {
+  socket.on('conversation:join', (data, callback) => {
     const { conversationId } = data;
     if (!conversationId) {
       logger.warn({ socketId: socket.id }, 'conversation:join sans conversationId');
+      if (typeof callback === 'function') {
+        callback({ success: false, error: 'Missing conversationId' });
+      }
       return;
     }
     socket.join(`conversation:${conversationId}`);
@@ -157,6 +160,9 @@ io.on('connection', (socket) => {
       { userId: socket.userId, conversationId },
       'Socket joined conversation room'
     );
+    if (typeof callback === 'function') {
+      callback({ success: true, conversationId });
+    }
   });
 
   // Quitter la room d'une conversation (à la fermeture de l'écran de chat)
@@ -278,6 +284,20 @@ io.on('connection', (socket) => {
   socket.on('call:offer', (data) => {
     const { offer, to } = data;
     const recipientSocketId = onlineUsers.get(to);
+    const callStateKey = `${socket.userId}-${to}`;
+    const callState = callStates.get(callStateKey);
+
+    if (!callState || callState.state !== 'ringing') {
+      logger.warn(
+        { from: socket.userId, to, currentState: callState?.state },
+        'SDP Offer received in invalid call state'
+      );
+      socket.emit('error', {
+        code: 'INVALID_CALL_STATE',
+        message: 'Cannot send SDP offer when call is not ringing',
+      });
+      return;
+    }
 
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('call:offer', {
@@ -440,17 +460,23 @@ io.on('connection', (socket) => {
     let callState = callStateForward || callStateReverse;
     let callStateKey = callStateForward ? callStateKey1 : callStateKey2;
     
-    // ========== ✅ FIX 2: VÉRIFICATION D'ÉTAT (MAINTENANT ACTIVÉ) ==========
-    // Vérifier que le call est vraiment connecté avant d'accepter les ICE candidates
-    
-    if (!callState || callState.state !== 'connected') {
+    // ========== ✅ FIX 2 (révisé): VÉRIFICATION D'ÉTAT ==========
+    // En WebRTC "trickle ICE", les candidates arrivent au fur et à mesure,
+    // dès l'offre SDP — donc AVANT que l'autre partie ait répondu (call:answer).
+    // N'accepter que l'état 'connected' bloquait systématiquement tous les
+    // premiers candidates envoyés pendant que l'appel sonne encore ('ringing'),
+    // empêchant toute négociation WebRTC d'aboutir. On accepte donc les
+    // candidates dès que l'appel est 'ringing' OU 'connected'.
+    const ACCEPTED_STATES_FOR_ICE = ['ringing', 'connected'];
+
+    if (!callState || !ACCEPTED_STATES_FOR_ICE.includes(callState.state)) {
       logger.warn(
         { from: userId, to, state: callState?.state },
-        'ICE candidate rejected: call not connected'
+        'ICE candidate rejected: call not ringing or connected'
       );
       socket.emit('error', {
-        message: 'Call not connected',
-        code: 'CALL_NOT_CONNECTED',
+        message: 'Call not active',
+        code: 'CALL_NOT_ACTIVE',
       });
       return; // ← Rejeter le candidate
     }
