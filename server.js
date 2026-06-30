@@ -142,6 +142,34 @@ io.on('connection', (socket) => {
     io.emit('user:online', { userId, userName, timestamp: new Date() });
   });
 
+  // ✅ FIX: Rejoindre la room d'une conversation pour recevoir message:new
+  // en temps réel. MessageService.createMessage() émet vers
+  // `conversation:${conversationID}` — sans ce handler, ce room reste vide
+  // et aucun client ne reçoit jamais les messages en temps réel.
+  socket.on('conversation:join', (data) => {
+    const { conversationId } = data;
+    if (!conversationId) {
+      logger.warn({ socketId: socket.id }, 'conversation:join sans conversationId');
+      return;
+    }
+    socket.join(`conversation:${conversationId}`);
+    logger.debug(
+      { userId: socket.userId, conversationId },
+      'Socket joined conversation room'
+    );
+  });
+
+  // Quitter la room d'une conversation (à la fermeture de l'écran de chat)
+  socket.on('conversation:leave', (data) => {
+    const { conversationId } = data;
+    if (!conversationId) return;
+    socket.leave(`conversation:${conversationId}`);
+    logger.debug(
+      { userId: socket.userId, conversationId },
+      'Socket left conversation room'
+    );
+  });
+
   // Message envoyé
   socket.on('message:send', (data) => {
     const { conversationId, recipientId, message } = data;
