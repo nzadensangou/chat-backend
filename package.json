@@ -1,15 +1,12 @@
 {
   "name": "chat-backend",
   "version": "1.0.0",
-  "description": "Chat application backend with Next.js",
+  "description": "Chat application backend with Next.js + Socket.IO (single service)",
   "type": "module",
   "scripts": {
-    "dev": "next dev",
-    "dev:socket": "node -r dotenv/config server.js",
-    "dev:full": "concurrently \"next dev\" \"node -r dotenv/config server.js\"",
+    "dev": "node -r dotenv/config server.js",
     "build": "next build",
-    "start": "next start",
-    "socket:start": "node -r dotenv/config server.js",
+    "start": "NODE_ENV=production node -r dotenv/config server.js",
     "lint": "next lint",
     "db:migrate": "knex migrate:latest",
     "db:migrate:make": "knex migrate:make",

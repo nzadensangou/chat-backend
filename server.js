@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 // MUST be first before any other imports!
 dotenv.config();
 
-import express from 'express';
+import next from 'next';
 import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { logger } from './lib/logger.js';
@@ -11,8 +11,26 @@ import fcmService from './lib/services/fcm.service.js';
 import { UserService } from './lib/services/user.service.js';
 import socketManager from './lib/socket-instance.js';
 
-const app = express();
-const server = http.createServer(app);
+// ========================
+// NEXT.JS APP SETUP
+// ========================
+// On initialise Next.js en mode programmatique pour pouvoir
+// le combiner avec le même serveur HTTP que Socket.IO
+const dev = process.env.NODE_ENV !== 'production';
+const nextApp = next({ dev });
+const handle = nextApp.getRequestHandler();
+
+const PORT = process.env.PORT || 3000;
+
+// ========================
+// HTTP + SOCKET.IO SETUP
+// ========================
+// Un seul serveur HTTP : Next.js gère TOUTES les routes (pages + /api/...)
+// Socket.IO est attaché à ce même serveur pour le temps réel
+const server = http.createServer((req, res) => {
+  handle(req, res);
+});
+
 const io = new SocketIOServer(server, {
   cors: {
     origin: process.env.FRONTEND_URL || 'http://localhost:3000',
@@ -23,9 +41,6 @@ const io = new SocketIOServer(server, {
 
 // ✅ Register Socket.IO instance for use in endpoints and services
 socketManager.setIO(io);
-
-// Middleware
-app.use(express.json());
 
 // Connection Pool pour tracker les utilisateurs online
 const onlineUsers = new Map(); // { userId: socket }
@@ -696,13 +711,9 @@ io.on('connection', (socket) => {
 });
 
 // Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    onlineUsers: onlineUsers.size,
-    connectedClients: io.engine.clientsCount,
-  });
-});
+// ⚠️ Cette route est désormais gérée par Next.js (pages/api/health.js)
+// car toutes les requêtes HTTP passent par handle(req, res).
+// Si tu veux garder un /health rapide ici sans passer par Next, vois la note plus bas.
 
 // Initialize Firebase Cloud Messaging (FCM) for push notifications
 (async () => {
@@ -723,8 +734,12 @@ app.get('/health', (req, res) => {
   }
 })();
 
-// Start server
-const PORT = process.env.SOCKET_IO_PORT || 3001;
-server.listen(PORT, () => {
-  logger.info({ port: PORT }, 'Socket.IO server started');
+// Start server (Next.js + Socket.IO sur le même port)
+nextApp.prepare().then(() => {
+  server.listen(PORT, () => {
+    logger.info({ port: PORT }, 'Server (Next.js + Socket.IO) started');
+  });
+}).catch((err) => {
+  logger.error({ error: err.message }, 'Error starting Next.js app');
+  process.exit(1);
 });
