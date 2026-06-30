@@ -69,25 +69,87 @@ const CANDIDATE_RATE_LIMIT_WINDOW = 10000; // Fenêtre de 10 secondes
  * Ces serveurs permettent aux clients de trouver leur adresse IP publique
  * et de relayer le trafic si la connexion P2P directe n'est pas possible
  */
-function getIceServers() {
+// ✅ TURN via Twilio Network Traversal Service.
+// Les identifiants TURN générés par Twilio expirent (~24h par défaut côté
+// Twilio) ; on les met en cache en mémoire et on ne refait un appel API
+// que lorsqu'ils sont périmés, pour éviter de solliciter Twilio à chaque
+// connexion socket (potentiellement des milliers par jour).
+let cachedIceServers = null;
+let cachedIceServersExpiry = 0;
+
+const STATIC_STUN_SERVERS = [
+  { urls: ['stun:stun.l.google.com:19302'] },
+  { urls: ['stun:stun1.l.google.com:19302'] },
+  { urls: ['stun:stun2.l.google.com:19302'] },
+  { urls: ['stun:stun3.l.google.com:19302'] },
+  { urls: ['stun:stun4.l.google.com:19302'] },
+];
+
+async function fetchTwilioIceServers() {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+  if (!accountSid || !authToken) {
+    logger.warn(
+      'TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN absents - serveurs TURN désactivés, STUN seul utilisé'
+    );
+    return null;
+  }
+
+  const basicAuth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
+
+  const response = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Tokens.json`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${basicAuth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Twilio Tokens API a répondu ${response.status}`);
+  }
+
+  const data = await response.json();
+  // data.ice_servers contient déjà les entrées stun: ET turn: fournies par Twilio
+  // data.ttl est en secondes (généralement 86400 = 24h)
   return {
-    iceServers: [
-      // STUN Servers (gratuits, resolvent l'adresse publique)
-      { urls: ['stun:stun.l.google.com:19302'] },
-      { urls: ['stun:stun1.l.google.com:19302'] },
-      { urls: ['stun:stun2.l.google.com:19302'] },
-      { urls: ['stun:stun3.l.google.com:19302'] },
-      { urls: ['stun:stun4.l.google.com:19302'] },
-      
-      // TURN Servers (optionnel pour production - relais du trafic)
-      // Décommenter et configurer avec vos paramètres:
-      // {
-      //   urls: ['turn:your-turn-server.com:3478?transport=udp', 'turn:your-turn-server.com:3478?transport=tcp'],
-      //   username: process.env.TURN_USERNAME || 'user',
-      //   credential: process.env.TURN_PASSWORD || 'pass',
-      // },
-    ],
+    iceServers: data.ice_servers,
+    ttlSeconds: Number(data.ttl) || 3600,
   };
+}
+
+async function getIceServers() {
+  const now = Date.now();
+
+  if (cachedIceServers && now < cachedIceServersExpiry) {
+    return cachedIceServers;
+  }
+
+  try {
+    const twilioResult = await fetchTwilioIceServers();
+
+    if (twilioResult) {
+      cachedIceServers = { iceServers: twilioResult.iceServers };
+      // On rafraîchit un peu avant l'expiration réelle (marge de 10%)
+      cachedIceServersExpiry = now + twilioResult.ttlSeconds * 1000 * 0.9;
+      logger.info(
+        { serverCount: twilioResult.iceServers.length, ttlSeconds: twilioResult.ttlSeconds },
+        'Twilio TURN/STUN servers refreshed'
+      );
+      return cachedIceServers;
+    }
+  } catch (error) {
+    logger.error({ error: error.message }, 'Échec récupération TURN Twilio - fallback STUN seul');
+  }
+
+  // Fallback : STUN public seul si Twilio n'est pas configuré ou indisponible.
+  // Les appels marcheront toujours sur la plupart des réseaux, mais
+  // échoueront derrière un NAT symétrique tant que ce fallback est actif.
+  return { iceServers: STATIC_STUN_SERVERS };
 }
 
 // ========================
@@ -119,9 +181,17 @@ io.on('connection', (socket) => {
     }
 
     // Envoyer la configuration STUN/TURN pour WebRTC
-    const iceConfig = getIceServers();
-    socket.emit('ice:servers', iceConfig);
-    logger.debug({ userId, serverCount: iceConfig.iceServers.length }, 'ICE servers configuration sent');
+    getIceServers()
+      .then((iceConfig) => {
+        socket.emit('ice:servers', iceConfig);
+        logger.debug(
+          { userId, serverCount: iceConfig.iceServers.length },
+          'ICE servers configuration sent'
+        );
+      })
+      .catch((error) => {
+        logger.error({ userId, error: error.message }, 'Failed to send ICE servers config');
+      });
 
     // Envoyer les ICE candidates en attente (bufferisés)
     if (candidateBuffer.has(userId)) {
@@ -140,6 +210,29 @@ io.on('connection', (socket) => {
 
     // Notifier tout le monde que cet user est online
     io.emit('user:online', { userId, userName, timestamp: new Date() });
+  });
+
+  // ✅ Permet au client de pousser un nouveau token FCM en cours de session,
+  // sans devoir se reconnecter (cas du onTokenRefresh de Firebase, qui peut
+  // se déclencher à tout moment : réinstallation, restauration de backup...).
+  // Sans cet event, un token rafraîchi côté client ne remontait jamais au
+  // serveur, qui continuait à utiliser l'ancien token (donc à échouer
+  // silencieusement sur les notifications push d'appel entrant).
+  socket.on('fcm:token-update', (data) => {
+    const { userId, fcmToken } = data;
+
+    if (!userId || !fcmToken) {
+      logger.warn({ socketId: socket.id }, 'fcm:token-update missing userId or fcmToken');
+      return;
+    }
+
+    UserService.updateFCMToken(userId, fcmToken)
+      .then(() => {
+        logger.info({ userId }, 'FCM token refreshed via fcm:token-update');
+      })
+      .catch((error) => {
+        logger.error({ userId, error: error.message }, 'Failed to update refreshed FCM token');
+      });
   });
 
   // ✅ FIX: Rejoindre la room d'une conversation pour recevoir message:new
