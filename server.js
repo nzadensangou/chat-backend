@@ -668,13 +668,21 @@ io.on('connection', (socket) => {
   socket.on('call:end', (data) => {
     const { participantIds } = data;
     
-    // ========== ✅ FIX 6b: AUTO-CLEANUP APRÈS 5 MINUTES ==========
     const CALL_STATE_CLEANUP_TIMEOUT = 5 * 60 * 1000; // 5 minutes
     
-    // Mettre à jour l'état de l'appel à 'ended'
+    // Mettre à jour l'état de l'appel à 'ended'. L'ordre des IDs peut varier
+    // selon qui termine l'appel (caller ou callee), donc on cherche les deux
+    // directions possibles du call state.
     participantIds.forEach((participantId) => {
-      const callStateKey = `${socket.userId}-${participantId}`;
-      if (callStates.has(callStateKey)) {
+      const directKey = `${socket.userId}-${participantId}`;
+      const reverseKey = `${participantId}-${socket.userId}`;
+      const callStateKey = callStates.has(directKey)
+        ? directKey
+        : callStates.has(reverseKey)
+            ? reverseKey
+            : null;
+
+      if (callStateKey) {
         const callState = callStates.get(callStateKey);
         callState.state = 'ended';
         logger.debug({ callStateKey, state: 'ended' }, 'Call state updated to ended');
@@ -683,7 +691,6 @@ io.on('connection', (socket) => {
         setTimeout(() => {
           if (callStates.has(callStateKey)) {
             const state = callStates.get(callStateKey);
-            // Ne supprimer que si l'état n'a pas changé
             if (state.state === 'ended') {
               callStates.delete(callStateKey);
               logger.debug({ callStateKey }, 'Call state cleaned up after end timeout');
