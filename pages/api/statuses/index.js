@@ -35,10 +35,10 @@ async function handlePost(req, res) {
 
   try {
     const userId = extractUserFromRequest(req);
-    const { text, type, backgroundColor, mediaUrl, visibility } = req.body;
+    const { text, caption, type, backgroundColor, mediaUrl, visibility } = req.body;
 
     const validData = validate.status.validateCreation({
-      text,
+      text: text ?? caption,
       type,
       backgroundColor,
       mediaUrl,
