@@ -171,6 +171,13 @@ io.on('connection', (socket) => {
     onlineUsers.set(userId, socket.id);
     socket.userId = userId;
 
+    // ✅ FIX: Room personnelle par utilisateur (`user:${userId}`), rejointe
+    // tant que le socket est connecté — indépendamment de l'écran affiché.
+    // Permet d'émettre message:new vers le destinataire même s'il n'a PAS
+    // ChatScreen ouvert sur cette conversation précise (ex: il est sur la
+    // liste des conversations, ou sur un tout autre écran de l'app).
+    socket.join(`user:${userId}`);
+
     logger.info({ userId, socketId: socket.id, userName }, 'User joined');
 
     // Save FCM token for push notifications
@@ -276,11 +283,19 @@ io.on('connection', (socket) => {
     // Envoyer le message au destinataire s'il est online
     const recipientSocketId = onlineUsers.get(recipientId);
     if (recipientSocketId) {
-      io.to(recipientSocketId).emit('message:receive', {
+      const normalizedMessage =
+        typeof message === 'string'
+          ? { content: message, type: 'text' }
+          : (message || {});
+
+      io.to(recipientSocketId).emit('message:new', {
         conversationId,
         senderId: socket.userId,
-        message,
-        timestamp: new Date(),
+        content: normalizedMessage.content ?? normalizedMessage.text ?? '',
+        type: normalizedMessage.type ?? 'text',
+        mediaUrl: normalizedMessage.mediaUrl ?? null,
+        messageId: normalizedMessage.messageId ?? normalizedMessage.id ?? Date.now(),
+        timestamp: normalizedMessage.timestamp ?? new Date(),
       });
       logger.debug({ recipientId, conversationId }, 'Message delivered in real-time');
     } else {
