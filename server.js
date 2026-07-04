@@ -116,6 +116,34 @@ async function fetchTwilioIceServers() {
   const data = await response.json();
   // data.ice_servers contient déjà les entrées stun: ET turn: fournies par Twilio
   // data.ttl est en secondes (généralement 86400 = 24h)
+
+  // ✅ DIAGNOSTIC : le "username" de chaque entrée turn: contient en réalité
+  // un timestamp Unix d'expiration, au format "1751600000:ACxxxxxxxx".
+  // On le décode ici pour logger l'heure d'expiration RÉELLE du jeton,
+  // ce qui permet de vérifier a posteriori si un échec ICE coïncidait avec
+  // un jeton expiré ou presque expiré (par ex. serveur resté up trop
+  // longtemps sans jamais rafraîchir _cachedIceServers).
+  const turnEntry = (data.ice_servers || []).find((s) => {
+    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+    return urls.some((u) => typeof u === 'string' && u.startsWith('turn:'));
+  });
+
+  if (turnEntry?.username) {
+    const expiryUnixSeconds = Number(turnEntry.username.split(':')[0]);
+    if (!Number.isNaN(expiryUnixSeconds)) {
+      const expiresAt = new Date(expiryUnixSeconds * 1000);
+      const secondsUntilExpiry = expiryUnixSeconds - Math.floor(Date.now() / 1000);
+      logger.info(
+        {
+          turnUsername: turnEntry.username,
+          expiresAt: expiresAt.toISOString(),
+          secondsUntilExpiry,
+        },
+        'Twilio TURN token decoded expiry'
+      );
+    }
+  }
+
   return {
     iceServers: data.ice_servers,
     ttlSeconds: Number(data.ttl) || 3600,
@@ -151,6 +179,40 @@ async function getIceServers() {
   // échoueront derrière un NAT symétrique tant que ce fallback est actif.
   return { iceServers: STATIC_STUN_SERVERS };
 }
+
+// ✅ FIX : rafraîchissement proactif + diffusion aux sockets déjà connectés.
+// Avant ce correctif, un client recevait `ice:servers` UNE SEULE FOIS, au
+// moment de `user:join`. Si son socket restait ouvert plus longtemps que la
+// durée de vie du jeton Twilio (typiquement ~24h), il continuait à utiliser
+// un jeton TURN expiré sans jamais le savoir jusqu'à sa prochaine
+// reconnexion — c'est ça, un jeton "mal renouvelé" côté client.
+// On vérifie donc toutes les 30 minutes si le cache doit être renouvelé,
+// et si c'est le cas, on repousse la nouvelle config à TOUT LE MONDE.
+const ICE_REFRESH_CHECK_INTERVAL = 30 * 60 * 1000; // 30 minutes
+
+setInterval(async () => {
+  const now = Date.now();
+  // On ne fait rien si le cache est encore valide (évite un appel Twilio
+  // inutile toutes les 30 minutes).
+  if (cachedIceServers && now < cachedIceServersExpiry) {
+    return;
+  }
+
+  try {
+    const iceConfig = await getIceServers();
+    let notified = 0;
+    onlineUsers.forEach((socketId) => {
+      io.to(socketId).emit('ice:servers', iceConfig);
+      notified += 1;
+    });
+    logger.info(
+      { notified, serverCount: iceConfig.iceServers.length },
+      'ICE servers proactively refreshed and pushed to connected clients'
+    );
+  } catch (error) {
+    logger.error({ error: error.message }, 'Proactive ICE servers refresh failed');
+  }
+}, ICE_REFRESH_CHECK_INTERVAL);
 
 // ========================
 // SOCKET EVENTS
