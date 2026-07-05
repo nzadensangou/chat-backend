@@ -54,6 +54,17 @@ const CANDIDATE_BUFFER_TIMEOUT = 60000; // ✅ FIX 5: 60 secondes expiration (au
 const callStates = new Map();
 const CALL_STATE_TIMEOUT = 300000; // 5 minutes expiration pour appels terminés
 
+// ✅ Rooms de réunion WebRTC en direct.
+// Différent de la table `participant` en base (qui ne dit que "a un jour
+// répondu à /api/calls/:id/answer" — une info d'historique/permission) :
+// ceci ne suit QUE qui a physiquement le flux audio/vidéo ouvert MAINTENANT
+// (MeetingRoomScreen monté côté Flutter). C'est cette room-ci qui sert de
+// base au signaling WebRTC en mesh (une connexion P2P directe par paire de
+// participants présents), pas la state machine 'ringing/connected' des
+// callStates ci-dessus, pensée pour un appel 1-à-1 qui "sonne".
+// Format: meetingRoomId (string) -> Set<userId>
+const meetingRooms = new Map();
+
 // Rate limiting pour ICE candidates
 // Format: { userId: {count: number, lastReset: timestamp} }
 const candidateRateLimits = new Map();
@@ -346,6 +357,76 @@ io.on('connection', (socket) => {
     );
   });
 
+  // ========================
+  // MEETING (WEBRTC MESH) EVENTS
+  // ========================
+
+  // ✅ Rejoindre la room WebRTC en direct d'une réunion.
+  // C'est CE point d'entrée — et non /api/calls/:id/answer — qui déclenche
+  // le vrai établissement WebRTC : /api/calls/:id/answer ne fait qu'écrire
+  // en base qu'on a répondu (historique/permissions), sans jamais toucher
+  // au signaling temps réel. Ici, on reçoit d'abord la liste des
+  // participants déjà présents (meeting:room-state) — c'est à NOUS,
+  // nouvel arrivant, d'envoyer une offre SDP à chacun d'eux (convention
+  // mesh : le nouvel arrivant initie vers l'existant, jamais l'inverse,
+  // pour éviter que deux pairs s'envoient une offre simultanément).
+  socket.on('meeting:join', (data) => {
+    const { meetingRoomId, userId } = data;
+    if (!meetingRoomId || !userId) {
+      logger.warn({ socketId: socket.id, data }, 'meeting:join sans meetingRoomId/userId');
+      return;
+    }
+
+    if (!meetingRooms.has(meetingRoomId)) {
+      meetingRooms.set(meetingRoomId, new Set());
+    }
+    const room = meetingRooms.get(meetingRoomId);
+
+    // Snapshot AVANT d'ajouter le nouvel arrivant à la room, sinon il se
+    // verrait lui-même dans sa propre liste de pairs à contacter.
+    const existingPeers = Array.from(room);
+    socket.emit('meeting:room-state', { meetingRoomId, peers: existingPeers });
+
+    room.add(userId);
+    socket.join(`meeting:${meetingRoomId}`);
+    // Certains clients (ex: organisateur qui n'a jamais émis call:*
+    // upfront) peuvent ne pas encore avoir socket.userId positionné ici.
+    socket.userId = socket.userId || userId;
+
+    // Prévenir les participants déjà présents : ils doivent s'attendre à
+    // recevoir une offre SDP de ce nouvel arrivant sous peu.
+    socket.to(`meeting:${meetingRoomId}`).emit('meeting:peer-joined', {
+      meetingRoomId,
+      userId,
+    });
+
+    logger.info(
+      { meetingRoomId, userId, roomSize: room.size },
+      'User joined meeting WebRTC room'
+    );
+  });
+
+  // Quitter la room WebRTC d'une réunion (fermeture de MeetingRoomScreen)
+  socket.on('meeting:leave', (data) => {
+    const { meetingRoomId, userId } = data;
+    if (!meetingRoomId || !userId) return;
+
+    const room = meetingRooms.get(meetingRoomId);
+    if (room) {
+      room.delete(userId);
+      if (room.size === 0) {
+        meetingRooms.delete(meetingRoomId);
+      }
+    }
+    socket.leave(`meeting:${meetingRoomId}`);
+    socket.to(`meeting:${meetingRoomId}`).emit('meeting:peer-left', {
+      meetingRoomId,
+      userId,
+    });
+
+    logger.info({ meetingRoomId, userId }, 'User left meeting WebRTC room');
+  });
+
   // Message envoyé
   socket.on('message:send', (data) => {
     const { conversationId, recipientId, message } = data;
@@ -460,29 +541,53 @@ io.on('connection', (socket) => {
 
   // Relayer l'offre SDP du caller au callee
   socket.on('call:offer', (data) => {
-    const { offer, to } = data;
+    const { offer, to, meetingRoomId } = data;
     const recipientSocketId = onlineUsers.get(to);
-    const callStateKey = `${socket.userId}-${to}`;
-    const callState = callStates.get(callStateKey);
 
-    if (!callState || callState.state !== 'ringing') {
-      logger.warn(
-        { from: socket.userId, to, currentState: callState?.state },
-        'SDP Offer received in invalid call state'
-      );
-      socket.emit('error', {
-        code: 'INVALID_CALL_STATE',
-        message: 'Cannot send SDP offer when call is not ringing',
-      });
-      return;
+    // ✅ Réunions (mesh) : pas de state machine 'ringing'/'connected' — un
+    // appel 1-à-1 "sonne" puis se "connecte", mais une réunion à N
+    // participants n'a pas cette notion (chaque paire négocie sa propre
+    // connexion P2P indépendamment, dès que les deux ont rejoint la même
+    // room). On vérifie donc juste que les DEUX côtés ont bien rejoint
+    // `meetingRooms.get(meetingRoomId)`, plutôt que callStates (pensé pour les
+    // appels 1-à-1 initiés via call:initiate).
+    if (meetingRoomId) {
+      const room = meetingRooms.get(meetingRoomId);
+      if (!room || !room.has(socket.userId) || !room.has(to)) {
+        logger.warn(
+          { meetingRoomId, from: socket.userId, to },
+          'SDP Offer rejected: not both participants in meeting room'
+        );
+        socket.emit('error', {
+          code: 'NOT_IN_MEETING',
+          message: 'Not both participants are in this meeting room',
+        });
+        return;
+      }
+    } else {
+      const callStateKey = `${socket.userId}-${to}`;
+      const callState = callStates.get(callStateKey);
+
+      if (!callState || callState.state !== 'ringing') {
+        logger.warn(
+          { from: socket.userId, to, currentState: callState?.state },
+          'SDP Offer received in invalid call state'
+        );
+        socket.emit('error', {
+          code: 'INVALID_CALL_STATE',
+          message: 'Cannot send SDP offer when call is not ringing',
+        });
+        return;
+      }
     }
 
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('call:offer', {
         offer,
         from: socket.userId,
+        meetingRoomId,
       });
-      logger.info({ from: socket.userId, to }, 'SDP Offer relayed');
+      logger.info({ from: socket.userId, to, meetingRoomId }, 'SDP Offer relayed');
     } else {
       logger.warn({ to }, 'Recipient not online for offer');
       socket.emit('error', { message: 'Recipient offline' });
@@ -491,36 +596,55 @@ io.on('connection', (socket) => {
 
   // Relayer la réponse SDP du callee au caller
   socket.on('call:answer', (data) => {
-    const { answer, to } = data;
-
-    // ✅ FIX 1: Vérifier que le call state est 'ringing' avant d'accepter l'answer
-    const callStateKey = `${to}-${socket.userId}`;
-    const callState = callStates.get(callStateKey);
-
-    if (!callState || callState.state !== 'ringing') {
-      logger.warn(
-        { to, userId: socket.userId, currentState: callState?.state },
-        'Answer received in wrong call state - rejecting'
-      );
-      socket.emit('error', {
-        message: 'Call is not in ringing state',
-        code: 'INVALID_CALL_STATE',
-      });
-      return; // ← Rejeter l'answer
-    }
-
+    const { answer, to, meetingRoomId } = data;
     const recipientSocketId = onlineUsers.get(to);
 
-    // Mettre à jour l'état de l'appel à 'connected'
-    callState.state = 'connected';
-    logger.debug({ callStateKey, state: 'connected' }, 'Call state updated to connected');
+    // ✅ Réunions (mesh) : même raisonnement que call:offer ci-dessus —
+    // pas de transition 'ringing' -> 'connected' à faire, une réponse SDP
+    // dans un mesh de réunion est juste acceptée dès lors que les deux
+    // participants sont bien dans la même room.
+    if (meetingRoomId) {
+      const room = meetingRooms.get(meetingRoomId);
+      if (!room || !room.has(socket.userId) || !room.has(to)) {
+        logger.warn(
+          { meetingRoomId, from: socket.userId, to },
+          'SDP Answer rejected: not both participants in meeting room'
+        );
+        socket.emit('error', {
+          code: 'NOT_IN_MEETING',
+          message: 'Not both participants are in this meeting room',
+        });
+        return;
+      }
+    } else {
+      // ✅ FIX 1: Vérifier que le call state est 'ringing' avant d'accepter l'answer
+      const callStateKey = `${to}-${socket.userId}`;
+      const callState = callStates.get(callStateKey);
+
+      if (!callState || callState.state !== 'ringing') {
+        logger.warn(
+          { to, userId: socket.userId, currentState: callState?.state },
+          'Answer received in wrong call state - rejecting'
+        );
+        socket.emit('error', {
+          message: 'Call is not in ringing state',
+          code: 'INVALID_CALL_STATE',
+        });
+        return; // ← Rejeter l'answer
+      }
+
+      // Mettre à jour l'état de l'appel à 'connected'
+      callState.state = 'connected';
+      logger.debug({ callStateKey, state: 'connected' }, 'Call state updated to connected');
+    }
 
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('call:answer', {
         answer,
         from: socket.userId,
+        meetingRoomId,
       });
-      logger.info({ from: socket.userId, to }, 'SDP Answer relayed');
+      logger.info({ from: socket.userId, to, meetingRoomId }, 'SDP Answer relayed');
     } else {
       logger.warn({ to }, 'Recipient not online for answer');
       socket.emit('error', { message: 'Recipient offline' });
@@ -613,50 +737,69 @@ io.on('connection', (socket) => {
     }
     
     // ========== ✅ FIX 7: VÉRIFIER LES PERMISSIONS ==========
-    // S'assurer que l'utilisateur participe vraiment à cet appel
-    // (pas un attaquant qui envoie des candidates pour un appel quelconque)
-    const callStateKey1 = `${userId}-${to}`;
-    const callStateKey2 = `${to}-${userId}`;
-    
-    const callStateForward = callStates.get(callStateKey1);
-    const callStateReverse = callStates.get(callStateKey2);
-    
-    // Il faut que l'un des deux états existe
-    if (!callStateForward && !callStateReverse) {
-      logger.warn(
-        { userId, to },
-        'User not participant in any call - rejecting ICE candidate'
-      );
-      socket.emit('error', {
-        message: 'You are not part of this call',
-        code: 'NOT_CALL_PARTICIPANT',
-      });
-      return; // ← Rejeter le candidate
-    }
-    
-    // Utiliser le call state qui existe (peu importe la direction)
-    let callState = callStateForward || callStateReverse;
-    let callStateKey = callStateForward ? callStateKey1 : callStateKey2;
-    
-    // ========== ✅ FIX 2 (révisé): VÉRIFICATION D'ÉTAT ==========
-    // En WebRTC "trickle ICE", les candidates arrivent au fur et à mesure,
-    // dès l'offre SDP — donc AVANT que l'autre partie ait répondu (call:answer).
-    // N'accepter que l'état 'connected' bloquait systématiquement tous les
-    // premiers candidates envoyés pendant que l'appel sonne encore ('ringing'),
-    // empêchant toute négociation WebRTC d'aboutir. On accepte donc les
-    // candidates dès que l'appel est 'ringing' OU 'connected'.
-    const ACCEPTED_STATES_FOR_ICE = ['ringing', 'connected'];
+    // S'assurer que l'utilisateur participe vraiment à cet appel/réunion
+    // (pas un attaquant qui envoie des candidates pour un échange quelconque)
+    const { meetingRoomId } = data;
 
-    if (!callState || !ACCEPTED_STATES_FOR_ICE.includes(callState.state)) {
-      logger.warn(
-        { from: userId, to, state: callState?.state },
-        'ICE candidate rejected: call not ringing or connected'
-      );
-      socket.emit('error', {
-        message: 'Call not active',
-        code: 'CALL_NOT_ACTIVE',
-      });
-      return; // ← Rejeter le candidate
+    if (meetingRoomId) {
+      // ✅ Réunions (mesh) : l'autorisation se base sur la room WebRTC de
+      // réunion (meetingRooms), pas sur callStates — un mesh n'a pas de
+      // notion d'appel "qui sonne" entre deux userId précis.
+      const room = meetingRooms.get(meetingRoomId);
+      if (!room || !room.has(userId) || !room.has(to)) {
+        logger.warn(
+          { meetingRoomId, userId, to },
+          'User not participant in meeting room - rejecting ICE candidate'
+        );
+        socket.emit('error', {
+          message: 'You are not part of this meeting',
+          code: 'NOT_CALL_PARTICIPANT',
+        });
+        return; // ← Rejeter le candidate
+      }
+    } else {
+      const callStateKey1 = `${userId}-${to}`;
+      const callStateKey2 = `${to}-${userId}`;
+
+      const callStateForward = callStates.get(callStateKey1);
+      const callStateReverse = callStates.get(callStateKey2);
+
+      // Il faut que l'un des deux états existe
+      if (!callStateForward && !callStateReverse) {
+        logger.warn(
+          { userId, to },
+          'User not participant in any call - rejecting ICE candidate'
+        );
+        socket.emit('error', {
+          message: 'You are not part of this call',
+          code: 'NOT_CALL_PARTICIPANT',
+        });
+        return; // ← Rejeter le candidate
+      }
+
+      // Utiliser le call state qui existe (peu importe la direction)
+      let callState = callStateForward || callStateReverse;
+
+      // ========== ✅ FIX 2 (révisé): VÉRIFICATION D'ÉTAT ==========
+      // En WebRTC "trickle ICE", les candidates arrivent au fur et à mesure,
+      // dès l'offre SDP — donc AVANT que l'autre partie ait répondu (call:answer).
+      // N'accepter que l'état 'connected' bloquait systématiquement tous les
+      // premiers candidates envoyés pendant que l'appel sonne encore ('ringing'),
+      // empêchant toute négociation WebRTC d'aboutir. On accepte donc les
+      // candidates dès que l'appel est 'ringing' OU 'connected'.
+      const ACCEPTED_STATES_FOR_ICE = ['ringing', 'connected'];
+
+      if (!callState || !ACCEPTED_STATES_FOR_ICE.includes(callState.state)) {
+        logger.warn(
+          { from: userId, to, state: callState?.state },
+          'ICE candidate rejected: call not ringing or connected'
+        );
+        socket.emit('error', {
+          message: 'Call not active',
+          code: 'CALL_NOT_ACTIVE',
+        });
+        return; // ← Rejeter le candidate
+      }
     }
 
     const recipientSocketId = onlineUsers.get(to);
@@ -665,8 +808,9 @@ io.on('connection', (socket) => {
       io.to(recipientSocketId).emit('ice:candidate', {
         candidate,
         from: userId,
+        meetingRoomId,
       });
-      logger.debug({ from: userId, to }, 'ICE candidate relayed');
+      logger.debug({ from: userId, to, meetingRoomId }, 'ICE candidate relayed');
     } else {
       // Bufferer le candidate si destinataire offline
       if (!candidateBuffer.has(to)) {
@@ -931,6 +1075,27 @@ io.on('connection', (socket) => {
     callKeysToDelete.forEach((key) => {
       callStates.delete(key);
       logger.debug({ key }, 'Cleared call state for disconnected user');
+    });
+
+    // ✅ Nettoyer les rooms de réunion WebRTC : sans ça, un utilisateur qui
+    // ferme brutalement l'app (crash, mise à jour forcée...) resterait
+    // fantôme dans meetingRooms — les pairs restants continueraient de le
+    // croire présent, et un nouvel arrivant recevrait son ID dans
+    // meeting:room-state alors qu'il n'y a plus personne pour répondre à
+    // l'offre SDP envoyée.
+    meetingRooms.forEach((room, meetingRoomId) => {
+      if (room.has(userId)) {
+        room.delete(userId);
+        if (room.size === 0) {
+          meetingRooms.delete(meetingRoomId);
+        } else {
+          socket.to(`meeting:${meetingRoomId}`).emit('meeting:peer-left', {
+            meetingRoomId,
+            userId,
+          });
+        }
+        logger.debug({ meetingRoomId, userId }, 'Cleared meeting room membership for disconnected user');
+      }
     });
     
     // Nettoyer les rate limits
