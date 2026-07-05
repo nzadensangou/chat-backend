@@ -233,6 +233,14 @@ io.on('connection', (socket) => {
     onlineUsers.set(userId, socket.id);
     socket.userId = userId;
 
+    // ✅ FIX présence : io.emit('user:online', ...) plus bas ne diffuse
+    // QUE vers les sockets déjà connectés au moment de l'émission. Un
+    // client qui se connecte APRÈS que d'autres utilisateurs soient déjà
+    // en ligne ne recevra donc jamais leur 'user:online' passé — il ne
+    // saura jamais qu'ils sont déjà connectés. On envoie donc un instantané
+    // de tous les utilisateurs actuellement en ligne, réservé à CE client.
+    socket.emit('users:online-list', Array.from(onlineUsers.keys()));
+
     // ✅ FIX: Room personnelle par utilisateur (`user:${userId}`), rejointe
     // tant que le socket est connecté — indépendamment de l'écran affiché.
     // Permet d'émettre message:new vers le destinataire même s'il n'a PAS
