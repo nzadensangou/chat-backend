@@ -9,13 +9,15 @@ async function handlePost(req, res) {
 
   try {
     const callerId = extractUserFromRequest(req);
-    const { receiverId, callType, room } = req.body;
+    const { receiverId, callType, room, scheduledStartTime, scheduledEndTime } = req.body;
 
     // Validate input
     const validData = validate.callInitiation({
       receiverId,
       callType,
       room,
+      scheduledStartTime,
+      scheduledEndTime,
     });
 
     // Initiate call
