@@ -16,7 +16,7 @@ async function handleGet(req, res) {
       FROM meeting m
       INNER JOIN participant p ON m.idMeeting = p.idMeeting
       INNER JOIN users u ON m.idOrganiser = u.alanyaID
-      WHERE p.IDparticipant = ? AND m.duree = 0
+      WHERE p.IDparticipant = ? AND m.isEnd = 0
       GROUP BY m.idMeeting
       ORDER BY m.start_time DESC
     `;
