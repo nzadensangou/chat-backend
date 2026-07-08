@@ -42,8 +42,11 @@ const io = new SocketIOServer(server, {
 // ✅ Register Socket.IO instance for use in endpoints and services
 socketManager.setIO(io);
 
-// Connection Pool pour tracker les utilisateurs online
-const onlineUsers = new Map(); // { userId: socket }
+// Connection Pool pour tracker les utilisateurs online.
+// Chaque client Flutter ouvre 2 sockets (chat + appels) : on garde un Set
+// de socketIds par userId, et on ne marque l'utilisateur offline que quand
+// TOUS ses sockets sont déconnectés.
+const onlineUsers = new Map(); // userId (string) -> Set<socketId>
 
 // Buffer pour stocker les ICE candidates en attente (si destinataire offline)
 const candidateBuffer = new Map();
@@ -74,6 +77,53 @@ const CANDIDATE_RATE_LIMIT_WINDOW = 10000; // Fenêtre de 10 secondes
 // ========================
 // UTILITY FUNCTIONS
 // ========================
+
+/** Normalise userId pour éviter les mismatches Map (3 vs "3"). */
+function normalizeUserId(userId) {
+  if (userId == null || userId === '' || userId === 'anonymous') return null;
+  return String(userId);
+}
+
+/** Enregistre un socket pour un utilisateur. Retourne true si l'utilisateur vient de passer online. */
+function addOnlineSocket(userId, socketId) {
+  const id = normalizeUserId(userId);
+  if (!id) return false;
+  if (!onlineUsers.has(id)) {
+    onlineUsers.set(id, new Set());
+  }
+  const sockets = onlineUsers.get(id);
+  const wasOffline = sockets.size === 0;
+  sockets.add(socketId);
+  return wasOffline;
+}
+
+/** Retire un socket. Retourne true si l'utilisateur est désormais totalement offline. */
+function removeOnlineSocket(userId, socketId) {
+  const id = normalizeUserId(userId);
+  if (!id || !onlineUsers.has(id)) return true;
+  const sockets = onlineUsers.get(id);
+  sockets.delete(socketId);
+  if (sockets.size === 0) {
+    onlineUsers.delete(id);
+    return true;
+  }
+  return false;
+}
+
+function isUserOnline(userId) {
+  const id = normalizeUserId(userId);
+  return id != null && onlineUsers.has(id) && onlineUsers.get(id).size > 0;
+}
+
+/** Émet un événement vers tous les sockets d'un utilisateur (chat + appels). */
+function emitToUser(userId, event, payload) {
+  const id = normalizeUserId(userId);
+  if (!id || !onlineUsers.has(id)) return false;
+  for (const socketId of onlineUsers.get(id)) {
+    io.to(socketId).emit(event, payload);
+  }
+  return true;
+}
 
 /**
  * Retourne la configuration des serveurs STUN/TURN pour WebRTC
@@ -212,9 +262,11 @@ setInterval(async () => {
   try {
     const iceConfig = await getIceServers();
     let notified = 0;
-    onlineUsers.forEach((socketId) => {
-      io.to(socketId).emit('ice:servers', iceConfig);
-      notified += 1;
+    onlineUsers.forEach((socketIds) => {
+      for (const socketId of socketIds) {
+        io.to(socketId).emit('ice:servers', iceConfig);
+        notified += 1;
+      }
     });
     logger.info(
       { notified, serverCount: iceConfig.iceServers.length },
@@ -234,14 +286,15 @@ io.on('connection', (socket) => {
 
   // User joins (après authentication)
   socket.on('user:join', (data) => {
-    const { userId, userName, fcmToken } = data;
-    
-    // ✅ Validate userId is not empty
-    if (!userId || userId === 'anonymous') {
-      logger.warn({ socketId: socket.id, userId }, 'User joined with invalid/anonymous ID');
+    const { userId: rawUserId, userName, fcmToken } = data;
+    const userId = normalizeUserId(rawUserId);
+
+    if (!userId) {
+      logger.warn({ socketId: socket.id, userId: rawUserId }, 'User joined with invalid/anonymous ID');
+      return;
     }
-    
-    onlineUsers.set(userId, socket.id);
+
+    const justCameOnline = addOnlineSocket(userId, socket.id);
     socket.userId = userId;
 
     // ✅ FIX présence : io.emit('user:online', ...) plus bas ne diffuse
@@ -259,7 +312,10 @@ io.on('connection', (socket) => {
     // liste des conversations, ou sur un tout autre écran de l'app).
     socket.join(`user:${userId}`);
 
-    logger.info({ userId, socketId: socket.id, userName }, 'User joined');
+    logger.info(
+      { userId, socketId: socket.id, userName, socketCount: onlineUsers.get(userId)?.size ?? 0 },
+      'User joined',
+    );
 
     // Save FCM token for push notifications
     if (fcmToken) {
@@ -285,19 +341,21 @@ io.on('connection', (socket) => {
     if (candidateBuffer.has(userId)) {
       const pendingCandidates = candidateBuffer.get(userId);
       logger.info({ userId, count: pendingCandidates.length }, 'Flushing buffered ICE candidates');
-      
+
       pendingCandidates.forEach(({ candidate, from }) => {
         socket.emit('ice:candidate', {
           candidate,
           from,
         });
       });
-      
+
       candidateBuffer.delete(userId);
     }
 
-    // Notifier tout le monde que cet user est online
-    io.emit('user:online', { userId, userName, timestamp: new Date() });
+    // Notifier tout le monde seulement quand le PREMIER socket de l'utilisateur se connecte
+    if (justCameOnline) {
+      io.emit('user:online', { userId, userName, timestamp: new Date() });
+    }
   });
 
   // ✅ Permet au client de pousser un nouveau token FCM en cours de session,
@@ -431,23 +489,21 @@ io.on('connection', (socket) => {
   socket.on('message:send', (data) => {
     const { conversationId, recipientId, message } = data;
 
-    // Envoyer le message au destinataire s'il est online
-    const recipientSocketId = onlineUsers.get(recipientId);
-    if (recipientSocketId) {
-      const normalizedMessage =
-        typeof message === 'string'
-          ? { content: message, type: 'text' }
-          : (message || {});
+    const normalizedMessage =
+      typeof message === 'string'
+        ? { content: message, type: 'text' }
+        : (message || {});
 
-      io.to(recipientSocketId).emit('message:new', {
-        conversationId,
-        senderId: socket.userId,
-        content: normalizedMessage.content ?? normalizedMessage.text ?? '',
-        type: normalizedMessage.type ?? 'text',
-        mediaUrl: normalizedMessage.mediaUrl ?? null,
-        messageId: normalizedMessage.messageId ?? normalizedMessage.id ?? Date.now(),
-        timestamp: normalizedMessage.timestamp ?? new Date(),
-      });
+    // Envoyer le message au destinataire s'il est online
+    if (emitToUser(recipientId, 'message:new', {
+      conversationId,
+      senderId: socket.userId,
+      content: normalizedMessage.content ?? normalizedMessage.text ?? '',
+      type: normalizedMessage.type ?? 'text',
+      mediaUrl: normalizedMessage.mediaUrl ?? null,
+      messageId: normalizedMessage.messageId ?? normalizedMessage.id ?? Date.now(),
+      timestamp: normalizedMessage.timestamp ?? new Date(),
+    })) {
       logger.debug({ recipientId, conversationId }, 'Message delivered in real-time');
     } else {
       logger.debug({ recipientId }, 'User offline, will get message when reconnects');
@@ -457,53 +513,47 @@ io.on('connection', (socket) => {
   // Typing indicator
   socket.on('typing:start', (data) => {
     const { conversationId, recipientId } = data;
-    const recipientSocketId = onlineUsers.get(recipientId);
-    
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('typing:active', {
-        conversationId,
-        userId: socket.userId,
-        isTyping: true,
-      });
-    }
+
+    emitToUser(recipientId, 'typing:active', {
+      conversationId,
+      userId: socket.userId,
+      isTyping: true,
+    });
   });
 
   socket.on('typing:stop', (data) => {
     const { conversationId, recipientId } = data;
-    const recipientSocketId = onlineUsers.get(recipientId);
-    
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('typing:active', {
-        conversationId,
-        userId: socket.userId,
-        isTyping: false,
-      });
-    }
+
+    emitToUser(recipientId, 'typing:active', {
+      conversationId,
+      userId: socket.userId,
+      isTyping: false,
+    });
   });
 
   // Appel entrant
   socket.on('call:initiate', (data) => {
     const { callerId, calleeId, callType } = data;
-    const calleeSocketId = onlineUsers.get(calleeId);
+    const normalizedCalleeId = normalizeUserId(calleeId);
 
     // Créer l'état de l'appel
-    const callStateKey = `${callerId}-${calleeId}`;
+    const callStateKey = `${normalizeUserId(callerId)}-${normalizedCalleeId}`;
     callStates.set(callStateKey, {
-      caller: callerId,
-      callee: calleeId,
+      caller: normalizeUserId(callerId),
+      callee: normalizedCalleeId,
       state: 'ringing',
       timestamp: Date.now(),
     });
     logger.debug({ callStateKey, state: 'ringing' }, 'Call state created');
 
-    if (calleeSocketId) {
-      io.to(calleeSocketId).emit('call:incoming', {
-        callerId,
+    if (isUserOnline(normalizedCalleeId)) {
+      emitToUser(normalizedCalleeId, 'call:incoming', {
+        callerId: normalizeUserId(callerId),
         callerName: data.callerName,
         callType,
         timestamp: new Date(),
       });
-      logger.info({ callerId, calleeId }, 'Incoming call sent');
+      logger.info({ callerId, calleeId: normalizedCalleeId }, 'Incoming call sent');
     } else {
       // ========== ✅ FIX 4: NOTIFIER LE CALLER SI OFFLINE ==========
       logger.info({ calleeId }, 'Callee offline - sending error to caller');
@@ -542,7 +592,6 @@ io.on('connection', (socket) => {
   // Relayer l'offre SDP du caller au callee
   socket.on('call:offer', (data) => {
     const { offer, to, meetingRoomId } = data;
-    const recipientSocketId = onlineUsers.get(to);
 
     // ✅ Réunions (mesh) : pas de state machine 'ringing'/'connected' — un
     // appel 1-à-1 "sonne" puis se "connecte", mais une réunion à N
@@ -581,12 +630,11 @@ io.on('connection', (socket) => {
       }
     }
 
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('call:offer', {
-        offer,
-        from: socket.userId,
-        meetingRoomId,
-      });
+    if (emitToUser(to, 'call:offer', {
+      offer,
+      from: socket.userId,
+      meetingRoomId,
+    })) {
       logger.info({ from: socket.userId, to, meetingRoomId }, 'SDP Offer relayed');
     } else {
       logger.warn({ to }, 'Recipient not online for offer');
@@ -597,7 +645,6 @@ io.on('connection', (socket) => {
   // Relayer la réponse SDP du callee au caller
   socket.on('call:answer', (data) => {
     const { answer, to, meetingRoomId } = data;
-    const recipientSocketId = onlineUsers.get(to);
 
     // ✅ Réunions (mesh) : même raisonnement que call:offer ci-dessus —
     // pas de transition 'ringing' -> 'connected' à faire, une réponse SDP
@@ -638,12 +685,11 @@ io.on('connection', (socket) => {
       logger.debug({ callStateKey, state: 'connected' }, 'Call state updated to connected');
     }
 
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('call:answer', {
-        answer,
-        from: socket.userId,
-        meetingRoomId,
-      });
+    if (emitToUser(to, 'call:answer', {
+      answer,
+      from: socket.userId,
+      meetingRoomId,
+    })) {
       logger.info({ from: socket.userId, to, meetingRoomId }, 'SDP Answer relayed');
     } else {
       logger.warn({ to }, 'Recipient not online for answer');
@@ -802,40 +848,39 @@ io.on('connection', (socket) => {
       }
     }
 
-    const recipientSocketId = onlineUsers.get(to);
+    const normalizedTo = normalizeUserId(to);
 
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('ice:candidate', {
-        candidate,
-        from: userId,
-        meetingRoomId,
-      });
-      logger.debug({ from: userId, to, meetingRoomId }, 'ICE candidate relayed');
+    if (emitToUser(normalizedTo, 'ice:candidate', {
+      candidate,
+      from: userId,
+      meetingRoomId,
+    })) {
+      logger.debug({ from: userId, to: normalizedTo, meetingRoomId }, 'ICE candidate relayed');
     } else {
       // Bufferer le candidate si destinataire offline
-      if (!candidateBuffer.has(to)) {
-        candidateBuffer.set(to, []);
+      if (!candidateBuffer.has(normalizedTo)) {
+        candidateBuffer.set(normalizedTo, []);
       }
-      
+
       const candidateData = {
         candidate,
         from: userId,
         timestamp: Date.now(),
       };
-      
-      const candidates = candidateBuffer.get(to);
+
+      const candidates = candidateBuffer.get(normalizedTo);
       candidates.push(candidateData);
-      
-      logger.debug({ from: userId, to, bufferSize: candidates.length }, 'ICE candidate buffered (recipient offline)');
-      
+
+      logger.debug({ from: userId, to: normalizedTo, bufferSize: candidates.length }, 'ICE candidate buffered (recipient offline)');
+
       // Auto-expirer après timeout
       setTimeout(() => {
-        const buff = candidateBuffer.get(to);
+        const buff = candidateBuffer.get(normalizedTo);
         if (buff) {
           const idx = buff.indexOf(candidateData);
           if (idx !== -1) {
             buff.splice(idx, 1);
-            logger.debug({ to }, 'Buffered ICE candidate expired');
+            logger.debug({ to: normalizedTo }, 'Buffered ICE candidate expired');
           }
         }
       }, CANDIDATE_BUFFER_TIMEOUT);
@@ -845,10 +890,9 @@ io.on('connection', (socket) => {
   // Rejeter appel
   socket.on('call:reject', (data) => {
     const { callerId } = data;
-    const callerSocketId = onlineUsers.get(callerId);
 
     // Mettre à jour l'état à 'rejected'
-    const callStateKey = `${callerId}-${socket.userId}`;
+    const callStateKey = `${normalizeUserId(callerId)}-${socket.userId}`;
     if (callStates.has(callStateKey)) {
       const callState = callStates.get(callStateKey);
       callState.state = 'rejected';
@@ -870,10 +914,9 @@ io.on('connection', (socket) => {
       }, CALL_STATE_CLEANUP_TIMEOUT);
     }
 
-    if (callerSocketId) {
-      io.to(callerSocketId).emit('call:rejected', {
-        rejectorId: socket.userId,
-      });
+    if (emitToUser(callerId, 'call:rejected', {
+      rejectorId: socket.userId,
+    })) {
       logger.info({ callerId }, 'Call rejected');
     }
   });
@@ -915,11 +958,14 @@ io.on('connection', (socket) => {
     });
     
     participantIds.forEach((participantId) => {
-      const participantSocketId = onlineUsers.get(participantId);
-      if (participantSocketId && participantSocketId !== socket.id) {
-        io.to(participantSocketId).emit('call:ended', {
-          enderId: socket.userId,
-        });
+      const id = normalizeUserId(participantId);
+      if (!id || !onlineUsers.has(id)) return;
+      for (const socketId of onlineUsers.get(id)) {
+        if (socketId !== socket.id) {
+          io.to(socketId).emit('call:ended', {
+            enderId: socket.userId,
+          });
+        }
       }
     });
     logger.info({ participantIds }, 'Call ended');
@@ -928,14 +974,11 @@ io.on('connection', (socket) => {
   // Marquer message comme lu
   socket.on('message:read', (data) => {
     const { conversationId, senderId } = data;
-    const senderSocketId = onlineUsers.get(senderId);
 
-    if (senderSocketId) {
-      io.to(senderSocketId).emit('message:marked-read', {
-        conversationId,
-        readById: socket.userId,
-      });
-    }
+    emitToUser(senderId, 'message:marked-read', {
+      conversationId,
+      readById: socket.userId,
+    });
   });
 
   // ========================
@@ -1057,7 +1100,7 @@ io.on('connection', (socket) => {
   // Disconnection
   socket.on('disconnect', () => {
     const userId = socket.userId;
-    onlineUsers.delete(userId);
+    const nowFullyOffline = removeOnlineSocket(userId, socket.id);
     
     // Nettoyer les candidates bufferisés pour cet utilisateur
     if (candidateBuffer.has(userId)) {
@@ -1105,7 +1148,9 @@ io.on('connection', (socket) => {
     }
     
     logger.info({ userId, socketId: socket.id }, 'User disconnected');
-    io.emit('user:offline', { userId, timestamp: new Date() });
+    if (nowFullyOffline) {
+      io.emit('user:offline', { userId, timestamp: new Date() });
+    }
   });
 
   // Erreur
