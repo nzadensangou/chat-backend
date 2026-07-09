@@ -8,7 +8,7 @@ import http from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { logger } from './lib/logger.js';
 import fcmService from './lib/services/fcm.service.js';
-import { UserService } from './lib/services/user.service.js';
+import { UserService, CallService } from './lib/services/index.js';
 import socketManager from './lib/socket-instance.js';
 
 // ========================
@@ -532,41 +532,74 @@ io.on('connection', (socket) => {
   });
 
   // Appel entrant
-  socket.on('call:initiate', (data) => {
-    const { callerId, calleeId, callType } = data;
+  socket.on('call:initiate', async (data) => {
+    const { callerId: rawCallerId, calleeId, callType, room, title, scheduledStartTime, scheduledEndTime } = data;
+    const callerId = normalizeUserId(rawCallerId);
     const normalizedCalleeId = normalizeUserId(calleeId);
 
+    if (!callerId || callerId !== socket.userId) {
+      logger.warn({ socketId: socket.id, callerId, socketUserId: socket.userId }, 'Unauthorized call:initiate request');
+      socket.emit('error', {
+        code: 'AUTH_MISMATCH',
+        message: 'Caller identity does not match authenticated socket',
+      });
+      return;
+    }
+
+    let meetingId = null;
+
+    try {
+      const meeting = await CallService.initiateCall(callerId, {
+        receiverId: normalizedCalleeId,
+        callType,
+        room,
+        title,
+        scheduledStartTime,
+        scheduledEndTime,
+      });
+      meetingId = meeting?.idMeeting || meeting?.id || null;
+    } catch (error) {
+      logger.error({ error: error.message, callerId, calleeId, room }, 'Failed to create meeting for call:initiate');
+      socket.emit('error', {
+        code: 'MEETING_CREATE_FAILED',
+        message: error.message || 'Unable to start call',
+      });
+      return;
+    }
+
     // Créer l'état de l'appel
-    const callStateKey = `${normalizeUserId(callerId)}-${normalizedCalleeId}`;
+    const callStateKey = `${callerId}-${normalizedCalleeId}`;
     callStates.set(callStateKey, {
-      caller: normalizeUserId(callerId),
+      caller: callerId,
       callee: normalizedCalleeId,
+      meetingId,
       state: 'ringing',
       timestamp: Date.now(),
     });
-    logger.debug({ callStateKey, state: 'ringing' }, 'Call state created');
+    logger.debug({ callStateKey, state: 'ringing', meetingId }, 'Call state created');
+
+    const incomingPayload = {
+      callerId,
+      callerName: data.callerName,
+      callType,
+      meetingId,
+      room,
+      timestamp: new Date(),
+    };
 
     if (isUserOnline(normalizedCalleeId)) {
-      emitToUser(normalizedCalleeId, 'call:incoming', {
-        callerId: normalizeUserId(callerId),
-        callerName: data.callerName,
-        callType,
-        timestamp: new Date(),
-      });
-      logger.info({ callerId, calleeId: normalizedCalleeId }, 'Incoming call sent');
+      emitToUser(normalizedCalleeId, 'call:incoming', incomingPayload);
+      logger.info({ callerId, calleeId: normalizedCalleeId, meetingId }, 'Incoming call sent');
     } else {
       // ========== ✅ FIX 4: NOTIFIER LE CALLER SI OFFLINE ==========
       logger.info({ calleeId }, 'Callee offline - sending error to caller');
-      
-      // Envoyer une erreur au caller pour qu'il sache que l'appel est impossible
       socket.emit('error', {
         code: 'CALLEE_OFFLINE',
         message: `${data.callerName || 'User'} is currently offline`,
         calleeId,
       });
-      
+
       // ========== FCM NOTIFICATION ==========
-      // Envoyer une notification push au callee en arrière-plan via FCM
       (async () => {
         try {
           const callee = await UserService.getUserById(calleeId);
@@ -575,6 +608,7 @@ io.on('connection', (socket) => {
               callerId,
               callerName: data.callerName || 'Unknown',
               callType: callType || 'audio',
+              meetingId,
             });
             if (!result.success) {
               logger.warn({ calleeId, error: result.error }, 'FCM notification failed');
@@ -592,28 +626,19 @@ io.on('connection', (socket) => {
   // Relayer l'offre SDP du caller au callee
   socket.on('call:offer', (data) => {
     const { offer, to, meetingRoomId } = data;
+    const room = meetingRoomId ? meetingRooms.get(meetingRoomId) : null;
+    const isMeetingRoomValid = Boolean(
+      room && room.has(socket.userId) && room.has(to)
+    );
 
-    // ✅ Réunions (mesh) : pas de state machine 'ringing'/'connected' — un
-    // appel 1-à-1 "sonne" puis se "connecte", mais une réunion à N
-    // participants n'a pas cette notion (chaque paire négocie sa propre
-    // connexion P2P indépendamment, dès que les deux ont rejoint la même
-    // room). On vérifie donc juste que les DEUX côtés ont bien rejoint
-    // `meetingRooms.get(meetingRoomId)`, plutôt que callStates (pensé pour les
-    // appels 1-à-1 initiés via call:initiate).
-    if (meetingRoomId) {
-      const room = meetingRooms.get(meetingRoomId);
-      if (!room || !room.has(socket.userId) || !room.has(to)) {
-        logger.warn(
-          { meetingRoomId, from: socket.userId, to },
-          'SDP Offer rejected: not both participants in meeting room'
-        );
-        socket.emit('error', {
-          code: 'NOT_IN_MEETING',
-          message: 'Not both participants are in this meeting room',
-        });
-        return;
-      }
-    } else {
+    if (meetingRoomId && !isMeetingRoomValid) {
+      logger.debug(
+        { meetingRoomId, from: socket.userId, to },
+        'Meeting room not ready or participants missing - falling back to 1:1 call state'
+      );
+    }
+
+    if (!isMeetingRoomValid) {
       const callStateKey = `${socket.userId}-${to}`;
       const callState = callStates.get(callStateKey);
 
@@ -645,26 +670,19 @@ io.on('connection', (socket) => {
   // Relayer la réponse SDP du callee au caller
   socket.on('call:answer', (data) => {
     const { answer, to, meetingRoomId } = data;
+    const room = meetingRoomId ? meetingRooms.get(meetingRoomId) : null;
+    const isMeetingRoomValid = Boolean(
+      room && room.has(socket.userId) && room.has(to)
+    );
 
-    // ✅ Réunions (mesh) : même raisonnement que call:offer ci-dessus —
-    // pas de transition 'ringing' -> 'connected' à faire, une réponse SDP
-    // dans un mesh de réunion est juste acceptée dès lors que les deux
-    // participants sont bien dans la même room.
-    if (meetingRoomId) {
-      const room = meetingRooms.get(meetingRoomId);
-      if (!room || !room.has(socket.userId) || !room.has(to)) {
-        logger.warn(
-          { meetingRoomId, from: socket.userId, to },
-          'SDP Answer rejected: not both participants in meeting room'
-        );
-        socket.emit('error', {
-          code: 'NOT_IN_MEETING',
-          message: 'Not both participants are in this meeting room',
-        });
-        return;
-      }
-    } else {
-      // ✅ FIX 1: Vérifier que le call state est 'ringing' avant d'accepter l'answer
+    if (meetingRoomId && !isMeetingRoomValid) {
+      logger.debug(
+        { meetingRoomId, from: socket.userId, to },
+        'Meeting room not ready or participants missing - falling back to 1:1 call state'
+      );
+    }
+
+    if (!isMeetingRoomValid) {
       const callStateKey = `${to}-${socket.userId}`;
       const callState = callStates.get(callStateKey);
 
@@ -786,24 +804,19 @@ io.on('connection', (socket) => {
     // S'assurer que l'utilisateur participe vraiment à cet appel/réunion
     // (pas un attaquant qui envoie des candidates pour un échange quelconque)
     const { meetingRoomId } = data;
+    const room = meetingRoomId ? meetingRooms.get(meetingRoomId) : null;
+    const isMeetingRoomValid = Boolean(
+      room && room.has(userId) && room.has(to)
+    );
 
-    if (meetingRoomId) {
-      // ✅ Réunions (mesh) : l'autorisation se base sur la room WebRTC de
-      // réunion (meetingRooms), pas sur callStates — un mesh n'a pas de
-      // notion d'appel "qui sonne" entre deux userId précis.
-      const room = meetingRooms.get(meetingRoomId);
-      if (!room || !room.has(userId) || !room.has(to)) {
-        logger.warn(
-          { meetingRoomId, userId, to },
-          'User not participant in meeting room - rejecting ICE candidate'
-        );
-        socket.emit('error', {
-          message: 'You are not part of this meeting',
-          code: 'NOT_CALL_PARTICIPANT',
-        });
-        return; // ← Rejeter le candidate
-      }
-    } else {
+    if (meetingRoomId && !isMeetingRoomValid) {
+      logger.debug(
+        { meetingRoomId, userId, to },
+        'Meeting room not ready or participants missing - falling back to 1:1 call state'
+      );
+    }
+
+    if (!isMeetingRoomValid) {
       const callStateKey1 = `${userId}-${to}`;
       const callStateKey2 = `${to}-${userId}`;
 
