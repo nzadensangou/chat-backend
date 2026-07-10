@@ -589,6 +589,22 @@ io.on('connection', (socket) => {
     });
     logger.debug({ callStateKey, state: 'ringing', meetingId }, 'Call state created');
 
+    // ✅ FIX (race condition "Cannot send SDP offer when call is not ringing") :
+    // le client Flutter enchaîne getUserMedia() + createOffer() + call:offer
+    // immédiatement après avoir émis call:initiate, SANS attendre de
+    // confirmation serveur. Or la création du callState ci-dessus dépend
+    // d'un aller-retour DB (transaction meeting + participant) qui peut
+    // être plus lent que la préparation de l'offre côté client — le
+    // call:offer arrivait alors AVANT que le callState existe, et se
+    // faisait rejeter (INVALID_CALL_STATE), entraînant en cascade le rejet
+    // de tous les ice:candidate suivants (NOT_CALL_PARTICIPANT), alors même
+    // que le callee, lui, recevait bien call:incoming (émis juste après,
+    // une fois le state posé) et pouvait décrocher normalement.
+    // On notifie donc explicitement l'appelant (lui seul, via `socket`,
+    // pas `emitToUser`) dès que le call state est prêt, pour qu'il puisse
+    // retarder l'envoi de son offre jusqu'à ce signal.
+    socket.emit('call:ringing', { meetingId, calleeId: normalizedCalleeId });
+
     const incomingPayload = {
       callerId,
       callerName: data.callerName,
