@@ -549,8 +549,19 @@ io.on('connection', (socket) => {
     let meetingId = null;
 
     try {
-      const meeting = await CallService.initiateCall(callerId, {
-        receiverId: normalizedCalleeId,
+      // ✅ FIX (bug "Invalid Receiver ID: must be a positive integer") :
+      // normalizeUserId() renvoie volontairement une STRING (pour les clés
+      // des Map en mémoire : onlineUsers, callStates...), mais
+      // CallService.initiateCall() valide receiverId/callerId via
+      // CallValidator.validateId(), qui exige `typeof id === 'number'`.
+      // Sans cette reconversion, la string passait tel quel jusqu'au
+      // validateur et faisait systématiquement échouer la création de
+      // la réunion (et par ricochet call:offer / ice:candidate, qui
+      // dépendent d'un callState jamais créé). On reconvertit donc en
+      // Number ICI, juste avant la frontière avec la couche métier/DB,
+      // sans toucher aux variables string utilisées plus bas pour les Map.
+      const meeting = await CallService.initiateCall(Number(callerId), {
+        receiverId: Number(normalizedCalleeId),
         callType,
         room,
         title,
