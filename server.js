@@ -41,29 +41,12 @@ const io = new SocketIOServer(server, {
 
 // ✅ Register Socket.IO instance for use in endpoints and services
 socketManager.setIO(io);
-logger.info('✅ Socket.IO instance registered in socketManager');
 
 // Connection Pool pour tracker les utilisateurs online.
 // Chaque client Flutter ouvre 2 sockets (chat + appels) : on garde un Set
 // de socketIds par userId, et on ne marque l'utilisateur offline que quand
 // TOUS ses sockets sont déconnectés.
 const onlineUsers = new Map(); // userId (string) -> Set<socketId>
-
-// ✅ FIX: Middleware pour garantir que Socket.IO est prêt avant de traiter les requêtes API
-// Cela évite les race conditions où une requête POST est traitée par Next.js AVANT que
-// socketManager.setIO() ait été appelé, ce qui rendrait socketManager.isAvailable() === false
-const socketReadyMiddleware = (req, res, next) => {
-  if (!socketManager.isAvailable()) {
-    logger.warn(
-      { method: req.method, path: req.url },
-      '⚠️ Request received but Socket.IO not yet available - this should not happen'
-    );
-  }
-  next();
-};
-
-// Appliquer le middleware AVANT le handler de Next.js
-server.on('request', socketReadyMiddleware);
 
 // Buffer pour stocker les ICE candidates en attente (si destinataire offline)
 const candidateBuffer = new Map();
