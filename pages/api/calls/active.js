@@ -25,6 +25,7 @@ async function handleGet(req, res) {
 
     return res.status(200).json(ApiResponse.success(rows || []));
   } catch (error) {
+    console.error('❌ [DEBUG] /api/calls/active a échoué:', error); // TEMP - à retirer après debug
     return handleError(error, res);
   }
 }
