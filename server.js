@@ -130,14 +130,103 @@ function emitToUser(userId, event, payload) {
  * Ces serveurs permettent aux clients de trouver leur adresse IP publique
  * et de relayer le trafic si la connexion P2P directe n'est pas possible
  */
-// ✅ TURN via Twilio Network Traversal Service.
-// Les identifiants TURN générés par Twilio expirent (~24h par défaut côté
-// Twilio) ; on les met en cache en mémoire et on ne refait un appel API
-// que lorsqu'ils sont périmés, pour éviter de solliciter Twilio à chaque
-// connexion socket (potentiellement des milliers par jour).
-let cachedIceServers = null;
-let cachedIceServersExpiry = 0;
+// ⛔ TURN via Twilio Network Traversal Service — DÉSACTIVÉ.
+// Tout ce bloc est conservé en commentaire pour référence / retour en
+// arrière éventuel. On utilise désormais notre propre serveur TURN
+// (voir plus bas : getIceServers()).
+//
+// let cachedIceServers = null;
+// let cachedIceServersExpiry = 0;
+//
+// async function fetchTwilioIceServers() {
+//   const accountSid = process.env.TWILIO_ACCOUNT_SID;
+//   const authToken = process.env.TWILIO_AUTH_TOKEN;
+//
+//   if (!accountSid || !authToken) {
+//     logger.warn(
+//       'TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN absents - serveurs TURN désactivés, STUN seul utilisé'
+//     );
+//     return null;
+//   }
+//
+//   const basicAuth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
+//
+//   const response = await fetch(
+//     `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Tokens.json`,
+//     {
+//       method: 'POST',
+//       headers: {
+//         Authorization: `Basic ${basicAuth}`,
+//         'Content-Type': 'application/x-www-form-urlencoded',
+//       },
+//     }
+//   );
+//
+//   if (!response.ok) {
+//     throw new Error(`Twilio Tokens API a répondu ${response.status}`);
+//   }
+//
+//   const data = await response.json();
+//   // data.ice_servers contient déjà les entrées stun: ET turn: fournies par Twilio
+//   // data.ttl est en secondes (généralement 86400 = 24h)
+//
+//   const turnEntry = (data.ice_servers || []).find((s) => {
+//     const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+//     return urls.some((u) => typeof u === 'string' && u.startsWith('turn:'));
+//   });
+//
+//   if (turnEntry?.username) {
+//     const expiryUnixSeconds = Number(turnEntry.username.split(':')[0]);
+//     if (!Number.isNaN(expiryUnixSeconds)) {
+//       const expiresAt = new Date(expiryUnixSeconds * 1000);
+//       const secondsUntilExpiry = expiryUnixSeconds - Math.floor(Date.now() / 1000);
+//       logger.info(
+//         {
+//           turnUsername: turnEntry.username,
+//           expiresAt: expiresAt.toISOString(),
+//           secondsUntilExpiry,
+//         },
+//         'Twilio TURN token decoded expiry'
+//       );
+//     }
+//   }
+//
+//   return {
+//     iceServers: data.ice_servers,
+//     ttlSeconds: Number(data.ttl) || 3600,
+//   };
+// }
+//
+// async function getIceServers_TWILIO() {
+//   const now = Date.now();
+//
+//   if (cachedIceServers && now < cachedIceServersExpiry) {
+//     return cachedIceServers;
+//   }
+//
+//   try {
+//     const twilioResult = await fetchTwilioIceServers();
+//
+//     if (twilioResult) {
+//       cachedIceServers = { iceServers: twilioResult.iceServers };
+//       cachedIceServersExpiry = now + twilioResult.ttlSeconds * 1000 * 0.9;
+//       logger.info(
+//         { serverCount: twilioResult.iceServers.length, ttlSeconds: twilioResult.ttlSeconds },
+//         'Twilio TURN/STUN servers refreshed'
+//       );
+//       return cachedIceServers;
+//     }
+//   } catch (error) {
+//     logger.error({ error: error.message }, 'Échec récupération TURN Twilio - fallback STUN seul');
+//   }
+//
+//   return { iceServers: STATIC_STUN_SERVERS };
+// }
 
+// ✅ TURN via notre propre serveur (fourni par l'enseignant) : IP directe
+// 76.13.44.253:3478, transport=tcp validé par test manuel (voir
+// test-turn.html — candidat "relay" obtenu avec ces identifiants).
+// Mêmes valeurs que lib/constants/webrtc_constants.dart côté Flutter.
 const STATIC_STUN_SERVERS = [
   { urls: ['stun:stun.l.google.com:19302'] },
   { urls: ['stun:stun1.l.google.com:19302'] },
@@ -146,119 +235,41 @@ const STATIC_STUN_SERVERS = [
   { urls: ['stun:stun4.l.google.com:19302'] },
 ];
 
-async function fetchTwilioIceServers() {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
+const OWN_TURN_URL = process.env.TURN_URL || 'turn:76.13.44.253:3478?transport=tcp';
+const OWN_TURN_USERNAME = process.env.TURN_USERNAME || 'alanya';
+const OWN_TURN_PASSWORD = process.env.TURN_PASSWORD || 'alanya2026';
 
-  if (!accountSid || !authToken) {
-    logger.warn(
-      'TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN absents - serveurs TURN désactivés, STUN seul utilisé'
-    );
-    return null;
-  }
-
-  const basicAuth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
-
-  const response = await fetch(
-    `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Tokens.json`,
+function buildOwnTurnIceServers() {
+  const iceServers = [
+    { urls: ['stun:76.13.44.253:3478'] },
+    ...STATIC_STUN_SERVERS,
     {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${basicAuth}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-    }
-  );
+      urls: [OWN_TURN_URL],
+      username: OWN_TURN_USERNAME,
+      credential: OWN_TURN_PASSWORD,
+    },
+  ];
 
-  if (!response.ok) {
-    throw new Error(`Twilio Tokens API a répondu ${response.status}`);
-  }
-
-  const data = await response.json();
-  // data.ice_servers contient déjà les entrées stun: ET turn: fournies par Twilio
-  // data.ttl est en secondes (généralement 86400 = 24h)
-
-  // ✅ DIAGNOSTIC : le "username" de chaque entrée turn: contient en réalité
-  // un timestamp Unix d'expiration, au format "1751600000:ACxxxxxxxx".
-  // On le décode ici pour logger l'heure d'expiration RÉELLE du jeton,
-  // ce qui permet de vérifier a posteriori si un échec ICE coïncidait avec
-  // un jeton expiré ou presque expiré (par ex. serveur resté up trop
-  // longtemps sans jamais rafraîchir _cachedIceServers).
-  const turnEntry = (data.ice_servers || []).find((s) => {
-    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-    return urls.some((u) => typeof u === 'string' && u.startsWith('turn:'));
-  });
-
-  if (turnEntry?.username) {
-    const expiryUnixSeconds = Number(turnEntry.username.split(':')[0]);
-    if (!Number.isNaN(expiryUnixSeconds)) {
-      const expiresAt = new Date(expiryUnixSeconds * 1000);
-      const secondsUntilExpiry = expiryUnixSeconds - Math.floor(Date.now() / 1000);
-      logger.info(
-        {
-          turnUsername: turnEntry.username,
-          expiresAt: expiresAt.toISOString(),
-          secondsUntilExpiry,
-        },
-        'Twilio TURN token decoded expiry'
-      );
-    }
-  }
-
-  return {
-    iceServers: data.ice_servers,
-    ttlSeconds: Number(data.ttl) || 3600,
-  };
+  logger.info({ turnUrl: OWN_TURN_URL }, 'Serveur TURN maison configuré (identifiants confirmés)');
+  return { iceServers };
 }
 
 async function getIceServers() {
-  const now = Date.now();
-
-  if (cachedIceServers && now < cachedIceServersExpiry) {
-    return cachedIceServers;
-  }
-
-  try {
-    const twilioResult = await fetchTwilioIceServers();
-
-    if (twilioResult) {
-      cachedIceServers = { iceServers: twilioResult.iceServers };
-      // On rafraîchit un peu avant l'expiration réelle (marge de 10%)
-      cachedIceServersExpiry = now + twilioResult.ttlSeconds * 1000 * 0.9;
-      logger.info(
-        { serverCount: twilioResult.iceServers.length, ttlSeconds: twilioResult.ttlSeconds },
-        'Twilio TURN/STUN servers refreshed'
-      );
-      return cachedIceServers;
-    }
-  } catch (error) {
-    logger.error({ error: error.message }, 'Échec récupération TURN Twilio - fallback STUN seul');
-  }
-
-  // Fallback : STUN public seul si Twilio n'est pas configuré ou indisponible.
-  // Les appels marcheront toujours sur la plupart des réseaux, mais
-  // échoueront derrière un NAT symétrique tant que ce fallback est actif.
-  return { iceServers: STATIC_STUN_SERVERS };
+  // Pas besoin de cache/expiration avec des identifiants statiques : on
+  // reconstruit la liste à chaque appel (opération locale, pas d'appel réseau).
+  return buildOwnTurnIceServers();
 }
 
-// ✅ FIX : rafraîchissement proactif + diffusion aux sockets déjà connectés.
-// Avant ce correctif, un client recevait `ice:servers` UNE SEULE FOIS, au
-// moment de `user:join`. Si son socket restait ouvert plus longtemps que la
-// durée de vie du jeton Twilio (typiquement ~24h), il continuait à utiliser
-// un jeton TURN expiré sans jamais le savoir jusqu'à sa prochaine
-// reconnexion — c'est ça, un jeton "mal renouvelé" côté client.
-// On vérifie donc toutes les 30 minutes si le cache doit être renouvelé,
-// et si c'est le cas, on repousse la nouvelle config à TOUT LE MONDE.
+// ✅ Rafraîchissement proactif + diffusion aux sockets déjà connectés.
+// Avec des identifiants TURN statiques (notre serveur maison), il n'y a
+// plus de jeton à expirer, donc plus besoin de vérifier un cache : ce
+// setInterval repousse simplement la config courante à tout le monde à
+// intervalle régulier (utile surtout si TURN_USERNAME/PASSWORD changent
+// dans .env et que le process est redémarré, ou si on repasse un jour
+// à des identifiants temporaires type HMAC).
 const ICE_REFRESH_CHECK_INTERVAL = 30 * 60 * 1000; // 30 minutes
 
 setInterval(async () => {
-  const now = Date.now();
-  // On ne fait rien si le cache est encore valide (évite un appel Twilio
-  // inutile toutes les 30 minutes).
-  if (cachedIceServers && now < cachedIceServersExpiry) {
-    return;
-  }
-
   try {
     const iceConfig = await getIceServers();
     let notified = 0;
